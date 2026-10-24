@@ -16,8 +16,8 @@ API_BASE = os.environ.get("LLM_BASE_URL", "https://aipipe.org/openrouter/v1").rs
 API_KEY = os.environ.get("LLM_API_KEY", "")
 MODEL = os.environ.get("LLM_MODEL", "openai/gpt-4.1")
 REASONING_MODEL = bool(re.search(r"(^|/)(gpt-5|o\d)", MODEL))   # these reject temperature / max_tokens
-CHUNK = int(os.environ.get("CHUNK", "3"))
-LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "30"))
+CHUNK = int(os.environ.get("CHUNK", "1"))
+LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "25"))
 DECIDE_BUDGET = float(os.environ.get("DECIDE_BUDGET", "38"))
 
 BATCH_MT = "application/vnd.ga5.invoice-claim-batch+json"
@@ -109,7 +109,7 @@ def uniq(seq):
 
 # ---------- document analysis (deterministic) ----------
 REF = re.compile(r"\[[^\[\]\n]+\]")
-CACHE_V = "v6:"   # bump to invalidate old cached decisions
+CACHE_V = "v7:"   # bump to invalidate old cached decisions
 
 CURS = "INR|USD|EUR|GBP|JPY|KRW|AED|SGD|AUD|CAD|CHF|CNY|HKD|SAR|ZAR|NZD|SEK|NOK|DKK"
 AMT = re.compile(rf"\b({CURS})\s?(\d[\d,]*(?:\.\d+)?)")
@@ -227,6 +227,87 @@ def analyze(pk):
     facts = extract_facts(ps)
     return {"ps": ps, "text": text, "refs_of": refs_of, "tri": tri_live, "facts": facts}
 
+
+# ---------- structured solver for multi-paragraph (layout b) packages ----------
+PO = r"(PO-[A-Za-z0-9-]*\d)"
+AMTG = rf"({CURS})\s?(\d[\d,]*(?:\.\d+)?)"
+
+def _amt(m, i=1):
+    return (m.group(i), minor(m.group(i), m.group(i + 1))) if m else (None, 0)
+
+def solve_b(live_text, live_idx, ps):
+    T = live_text
+    info, used = {}, set()
+    def mark(rx):
+        for i in live_idx:
+            if re.search(rx, ps[i], re.I): used.add(i)
+    # current order / invoice amounts
+    cur_po = None
+    for rx in [rf"currently submitted order is {PO}", rf"Order {PO} is signed", rf"covers order {PO}",
+               rf"submitted (?:order|invoice) (?:is |for )?{PO}", rf"current(?:ly)? order {PO}"]:
+        m = re.search(rx, T, re.I)
+        if m: cur_po = m.group(1); break
+    signed_cur, signed = _amt(re.search(rf"signed (?:for|at) {AMTG}", T, re.I))
+    inv_cur, inv_total = _amt(re.search(rf"(?:submitted )?invoice total (?:is|of) {AMTG}", T, re.I))
+    corr = re.search(rf"(?<!No )corrected invoice[^.]*?{AMTG}", T, re.I)
+    if corr: inv_cur, inv_total = _amt(corr)
+    inst_cur, inst_total = _amt(re.search(rf"(?:instrument|invoice) INV-[\w-]*[^.]*?{AMTG}", T, re.I))
+    total = inv_total or inst_total or signed
+    cur = inv_cur or inst_cur or signed_cur
+    # prior payment
+    prior = re.search(rf"(?:previously|already) (?:settled|paid|discharged) order {PO}", T, re.I) \
+        or re.search(rf"settled order {PO}", T, re.I)
+    dup = bool(prior and cur_po and prior.group(1).upper() == cur_po.upper())
+    if prior: mark(r"(previously|already) (settled|paid|discharged)|settled order")
+    # bank change
+    bank = re.search(r"Vendor master lists account ([\w-]+)\.? Remittance instructions now specify ([\w-]+)", T, re.I)
+    hold = False
+    if bank:
+        mark(r"Vendor master lists account")
+        changed = bank.group(1).upper() != bank.group(2).upper()
+        cb = re.search(r"callback[^.]*\.", T[bank.end():], re.I)
+        cbt = cb.group(0) if cb else ""
+        verified = bool(re.search(r"confirmed|verified|completed", cbt, re.I)) and not re.search(r"awaiting|pending|not yet|unverified|outstanding", cbt, re.I)
+        hold = changed and not verified
+    # order/invoice difference
+    exc = False
+    if signed and (inv_total or inst_total):
+        other = inv_total or inst_total
+        exc = abs(signed - other) > max(100, 0.005 * signed)
+        mark(r"signed (for|at)|invoice total")
+    if cur_po: mark(re.escape(cur_po))
+    # delegation limit
+    limit = 0
+    for i in live_idx:
+        p = ps[i]
+        if LIMIT_WORDS.search(p) and not re.search(r"Payment controls", p, re.I):
+            for m in AMT.finditer(p):
+                v = minor(m.group(1), m.group(2))
+                if v and v != total and v != signed:
+                    limit = v; used.add(i); break
+        if limit: break
+    policy_i = [i for i in live_idx if re.search(r"Payment controls|controls?:", ps[i], re.I)]
+    used.update(policy_i)
+    structured = bool(cur_po or bank or signed or prior)
+    if dup: action = "reject_duplicate"
+    elif exc: action = "open_exception"
+    elif hold: action = "hold_invoice"
+    elif limit and total: action = "request_approval" if total > limit else "settle_invoice"
+    else: action = None
+    info.update(total=total, cur=cur, cur_po=cur_po, limit=limit)
+    return action if structured else None, info, [i for i in live_idx if i in used]
+
+VENDOR_B = [r"\bto ([A-Z][A-Za-z0-9&'.\- ]{1,50}?) previously", r"\bSupplier ([A-Z][A-Za-z0-9&'.\- ]{1,50}?)(?=;|,|\.|\s+invoice|\s+for\b)",
+            r"\bvendor ([A-Z][A-Za-z0-9&'.\- ]{1,50}?)(?=;|,|\.|\s+for\b|\s+invoice)", r"\bfrom ([A-Z][A-Za-z0-9&'.\- ]{1,50}?)(?=;|,|\.|\s+for\b|\s+covers)"]
+BAD_VENDOR = re.compile(r"^(The|This|A|An|Order|Payment|Vendor|Operations|Archive|Policy)\b|\bAC-", re.I)
+
+def vendor_b(text):
+    for rx in VENDOR_B:
+        for m in re.finditer(rx, text):
+            v = m.group(1).strip()
+            if not BAD_VENDOR.search(v): return v
+    return None
+
 TEMPLATE = {
     "settle_invoice": "The records reconcile, no prior payment or bank-detail issue exists, and the total is within autonomous authority, so the invoice can be settled.",
     "request_approval": "The invoice is commercially valid and reconciled, but the total exceeds this queue's delegated payment authority, so a named approver must approve it.",
@@ -279,6 +360,9 @@ def build(pk, d, allow_no_model=False):
         A = analyze(pk)
         ps, text, refs_of = A["ps"], A["text"], A["refs_of"]
         model_action = d.get("action") if d.get("action") in ACTIONS else None
+        if not model_action and d:
+            found = [a for a in ACTIONS if a in json.dumps(d)]
+            if len(found) == 1: model_action = found[0]
         if not model_action and not allow_no_model:
             print("build: no/invalid model action", str(d)[:200]); return None
         action = model_action
@@ -312,30 +396,37 @@ def build(pk, d, allow_no_model=False):
         else:
             # ----- layout (b): evidence spread over single-ref paragraphs -----
             tagged = [i for i, r in enumerate(refs_of) if len(r) == 1]
-            sig = {i: signals(ps[i], total) for i in tagged}
-            policy = [i for i in tagged if not DECOY.search(ps[i]) and
-                      (len(sig[i]) >= 2 or re.search(r"payment controls|controls?:", ps[i], re.I))]
-            live = [i for i in tagged if not DECOY.search(ps[i]) and i not in policy]
-            live_hits = set().union(*[sig[i] for i in live]) if live else set()
-            t = top(live_hits)
-            if not action:
-                live_text = "\n".join(ps[i] for i in live)
-                action = t or ("settle_invoice" if clean_count(live_text) >= 2 else "hold_invoice")
-            elif t and action not in live_hits and (action in ("settle_invoice", "request_approval")
-                                                      or PRIORITY.index(action) > PRIORITY.index(t)):
-                action = t
-            bad = {refs_of[i][0] for i in tagged if DECOY.search(ps[i])}
+            live = [i for i in tagged if not DECOY.search(ps[i]) or re.search(r"Payment controls", ps[i], re.I)]
+            live_text = "\n".join(ps[i] for i in live)
+            s_action, info, used = solve_b(live_text, live, ps)
+            if s_action:
+                action = s_action                     # structured comparison wins
+            elif not action:
+                hits = set().union(*[signals(ps[i], total) for i in live if not re.search(r"Payment controls", ps[i], re.I)]) if live else set()
+                action = top(hits) or ("settle_invoice" if clean_count(live_text) >= 2 else "hold_invoice")
+            # facts for layout b
+            if not cf.get("amountMinor") and info.get("total"):
+                facts["amountMinor"], facts["currency"] = info["total"], info["cur"] or facts["currency"]
+                total = facts["amountMinor"]
+            if not cf.get("vendorName"):
+                v = vendor_b(live_text) or vendor_b(text)
+                mv = re.sub(r"^(supplier|vendor)\s+", "", str(mf.get("vendorName", "")).strip(), flags=re.I).strip()
+                facts["vendorName"] = mv or v or "unknown"
+            if facts["invoiceNumber"] == "unknown":
+                m = INVNO.search(live_text) or INVNO.search(text)
+                if m: facts["invoiceNumber"] = m.group(0)
+            bad = {refs_of[i][0] for i in tagged if i not in live}
             mrefs = d.get("refs") if isinstance(d.get("refs"), list) else []
             mrefs = uniq(["[" + x.strip().strip("[]").strip() + "]" for x in mrefs if isinstance(x, str) and x.strip("[] ")])
             mrefs = [r for r in mrefs if r in text and r not in bad]
-            support = [refs_of[i][0] for i in live if action in sig[i]]
-            pol = [refs_of[i][0] for i in policy]
-            inst = [refs_of[i][0] for i in live if INVNO.search(ps[i]) or AMT.search(ps[i])]
-            other = [refs_of[i][0] for i in live]
-            if action == model_action:
-                refs = uniq(mrefs + support + pol + inst + other)[:3]
+            struct_refs = [refs_of[i][0] for i in used]
+            live_refs = [refs_of[i][0] for i in live]
+            if len(live_refs) == 3:
+                refs = live_refs
+            elif action == model_action and len(mrefs) == 3:
+                refs = mrefs
             else:
-                refs = uniq(support + pol + inst + mrefs + other)[:3]
+                refs = uniq(struct_refs + mrefs + live_refs)[:3]
             if len(refs) < 3:
                 refs = uniq(refs + [r[0] for r in refs_of if r] + REF.findall(text))[:3]
         if len(refs) != 3:
