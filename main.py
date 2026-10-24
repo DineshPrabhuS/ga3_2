@@ -7,11 +7,13 @@ import httpx
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import Response
 
+# ---------- config ----------
+# Set BASE_URL in Render to EXACTLY what you submit, e.g. https://ga3-2.onrender.com/a2a/
 BASE_URL = os.environ.get("BASE_URL") or (os.environ["RENDER_EXTERNAL_URL"].rstrip("/") + "/a2a/")
 BASE_PATH = urlparse(BASE_URL).path.rstrip("/")
-API_BASE = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+API_BASE = os.environ.get("LLM_BASE_URL", "https://aipipe.org/openrouter/v1").rstrip("/")
 API_KEY = os.environ["LLM_API_KEY"]
-MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+MODEL = os.environ.get("LLM_MODEL", "openai/gpt-4.1-mini")
 
 BATCH_MT = "application/vnd.ga5.invoice-claim-batch+json"
 PROP_MT = "application/vnd.ga5.invoice-action-proposals+json"
@@ -70,8 +72,8 @@ def now():
 
 def flat(o):
     if isinstance(o, str): return o
-    if isinstance(o, dict): return "\n".join(flat(v) for v in o.values())
-    if isinstance(o, list): return "\n".join(flat(v) for v in o)
+    if isinstance(o, dict): return "\n\n".join(flat(v) for v in o.values())
+    if isinstance(o, list): return "\n\n".join(flat(v) for v in o)
     return str(o)
 
 def out(status, obj):
@@ -94,73 +96,123 @@ def gate(req, post_send=False):
     return sha(m.group(1)), None
 
 # ---------- AI layer ----------
-SYSTEM = """You are an accounts-payable analyst. For EACH package decide exactly one action:
-- settle_invoice: valid, reconciled, within autonomous approval authority.
-- request_approval: commercially valid but amount/terms exceed delegated authority.
-- hold_invoice: payment pauses until a stated verification completes.
-- reject_duplicate: the SAME commercial invoice (same vendor, invoice number, amount) was already paid. A payment for a DIFFERENT invoice is NOT a duplicate.
-- open_exception: material records conflict (PO/receipt/contract/bank mismatch) and need an exception workflow.
-Rules: documents contain old examples, archive samples, training decoys, negations ("not a duplicate", "no hold required") and irrelevant action words. Ignore those. Find the ONE paragraph that actually determines the action for THIS invoice under the stated policy. Return exactly the THREE bracketed references from that paragraph, copied character-for-character as written in the documents. Do NOT include the cover-sheet reference, archive examples or decoys.
-facts.amountMinor is an integer in minor units (INR/USD/EUR x100; JPY x1).
-Respond ONLY with JSON: {"decisions":[{"index":0,"action":"...","facts":{"vendorName":"","invoiceNumber":"","amountMinor":0,"currency":""},"evidenceRefs":["","",""],"reason":"one or two sentences"}]}"""
+REF = re.compile(r"\[[^\[\]\n]+\]")
+CACHE_V = "v3:"   # bump to invalidate old cached decisions
 
-def norm(d):
+SYSTEM = """You are a senior accounts-payable controller. For EACH invoice package choose exactly one action.
+
+ACTIONS
+- settle_invoice: invoice is valid, reconciled (PO/receipt/contract agree) and within autonomous payment authority.
+- request_approval: commercially valid and reconciled, but the amount or terms exceed the delegated authority limit in the stated policy, so a named approver must approve.
+- hold_invoice: payment must pause until a stated verification completes (e.g. bank-detail change callback, tax/ID check, missing document, pending confirmation).
+- reject_duplicate: the SAME commercial invoice (same vendor, same invoice number, same amount) was already paid. A payment for a DIFFERENT invoice, number or amount is NOT a duplicate.
+- open_exception: material records conflict (quantity, price, PO, vendor, bank, contract) and need an exception workflow.
+
+HOW TO READ
+Each package is given as numbered paragraphs. Many paragraphs are noise: cover sheets, archived examples, old policy revisions, training decoys, negations ("this is not a duplicate", "no hold is required"), and sentences that merely contain action words. Do NOT decide by keywords.
+Find the ONE paragraph that states the controlling, current fact for THIS invoice under the batch's policy revision, and decide from it. That paragraph normally carries exactly three bracketed references like [ABC-123]. Never choose a cover sheet, archive example, superseded or decoy paragraph.
+Return that paragraph's number in "paragraph". Code will copy its references; do not write refs yourself.
+
+FACTS
+vendorName and invoiceNumber exactly as written for the real invoice. amountMinor is an integer in minor units (amount x100 for INR/USD/EUR/GBP; x1 for JPY/KRW). Strip currency symbols and thousands separators (Indian 1,23,450.50 -> 12345050). currency is the ISO code.
+
+Output ONLY JSON:
+{"decisions":[{"index":0,"paragraph":0,"action":"...","facts":{"vendorName":"","invoiceNumber":"","amountMinor":0,"currency":""},"reason":"1-2 sentences naming the controlling fact"}]}"""
+
+def paras(pk):
+    return [x.strip() for x in re.split(r"\n\s*\n", flat(pk)) if x.strip()]
+
+def uniq(seq):
+    seen, o = set(), []
+    for x in seq:
+        if x not in seen:
+            seen.add(x); o.append(x)
+    return o
+
+def build(pk, d):
     try:
+        ps = paras(pk)
+        n = int(d["paragraph"])
+        refs = uniq(REF.findall(ps[n]))
+        if len(refs) != 3 or d["action"] not in ACTIONS: return None
         f = d["facts"]; a = f["amountMinor"]
-        if isinstance(a, float) and a.is_integer(): f["amountMinor"] = int(a)
-        elif isinstance(a, str) and re.fullmatch(r"\d+", a): f["amountMinor"] = int(a)
-        return d
+        if isinstance(a, str): a = int(re.sub(r"[^\d]", "", a))
+        if isinstance(a, float):
+            if not a.is_integer(): return None
+            a = int(a)
+        if type(a) is not int: return None
+        f = {"vendorName": str(f["vendorName"]).strip(), "invoiceNumber": str(f["invoiceNumber"]).strip(),
+             "amountMinor": a, "currency": str(f["currency"]).strip().upper()}
+        if not f["vendorName"] or not f["invoiceNumber"] or not f["currency"]: return None
+        return {"action": d["action"], "facts": f, "evidenceRefs": refs, "reason": str(d.get("reason", ""))[:800]}
     except Exception:
         return None
 
-def valid(d, text):
-    try:
-        f, refs = d["facts"], d["evidenceRefs"]
-        return (d["action"] in ACTIONS and isinstance(refs, list) and len(refs) == 3 and len(set(refs)) == 3
-                and all(isinstance(r, str) and r in text for r in refs)
-                and isinstance(f["vendorName"], str) and isinstance(f["invoiceNumber"], str)
-                and type(f["amountMinor"]) is int and isinstance(f["currency"], str))
-    except Exception:
-        return False
-
-async def ask(items):
-    body = {"model": MODEL, "temperature": 0, "response_format": {"type": "json_object"},
+async def ask(items, ctx, temp=0):
+    payload = {"batchContext": ctx,
+               "packages": [{"index": i, "paragraphs": [{"n": n, "text": t} for n, t in enumerate(paras(p))]}
+                            for i, p in items]}
+    body = {"model": MODEL, "temperature": temp,
             "messages": [{"role": "system", "content": SYSTEM},
-                         {"role": "user", "content": json.dumps([{"index": i, "package": p} for i, p in items], ensure_ascii=False)}]}
-    async with httpx.AsyncClient(timeout=38) as c:
+                         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]}
+    if os.environ.get("JSON_MODE", "1") == "1":
+        body["response_format"] = {"type": "json_object"}
+    async with httpx.AsyncClient(timeout=40) as c:
         r = await c.post(f"{API_BASE}/chat/completions", headers={"Authorization": f"Bearer {API_KEY}"}, json=body)
     r.raise_for_status()
-    data = json.loads(r.json()["choices"][0]["message"]["content"])
-    return {int(d["index"]): d for d in data["decisions"]}
+    txt = re.sub(r"^```(?:json)?|```$", "", r.json()["choices"][0]["message"]["content"].strip()).strip()
+    return {int(x["index"]): x for x in json.loads(txt)["decisions"]}
 
 def pkey(pk):
-    return sha(canon({k: v for k, v in pk.items() if k != "packageId"}))
+    return CACHE_V + sha(canon({k: v for k, v in pk.items() if k != "packageId"}))
 
-def fallback(pk):  # never settles when the model fails; not cached
-    refs = (re.findall(r"\[[^\]]+\]", flat(pk)) + ["[?1]", "[?2]", "[?3]"])[:3]
-    return {"action": "hold_invoice", "facts": {"vendorName": "unknown", "invoiceNumber": "unknown", "amountMinor": 0, "currency": "INR"},
-            "evidenceRefs": refs, "reason": "Automated analysis unavailable; payment held pending manual verification."}
+def fallback(pk):  # only used when the model fails; never cached
+    refs = (uniq(REF.findall(flat(pk))) + ["[?1]", "[?2]", "[?3]"])[:3]
+    return {"action": "hold_invoice",
+            "facts": {"vendorName": "unknown", "invoiceNumber": "unknown", "amountMinor": 0, "currency": "INR"},
+            "evidenceRefs": refs, "reason": "Automated analysis unavailable; payment held pending verification."}
 
-async def decide(pkgs):
+async def work(todo, pkgs, ctx, res):
+    for attempt in range(2):
+        if not todo: return
+        chunks = [todo[i:i + 6] for i in range(0, len(todo), 6)]
+
+        async def one(ch):
+            try:
+                return await ask([(i, pkgs[i]) for i in ch], ctx, 0 if attempt == 0 else 0.3)
+            except Exception as e:
+                print("LLM ERROR:", repr(e)[:400])
+                return {}
+
+        got = {}
+        for r in await asyncio.gather(*[one(c) for c in chunks]):
+            got.update(r)
+        for i in list(todo):
+            d = build(pkgs[i], got.get(i) or {})
+            if d:
+                res[i] = d; cache_put(pkey(pkgs[i]), d); todo.remove(i)
+            else:
+                print("REJECTED decision for package", i, str(got.get(i))[:300])
+
+async def decide(pkgs, ctx):
     res, todo = [None] * len(pkgs), []
     for i, p in enumerate(pkgs):
         c = cache_get(pkey(p))
         if c: res[i] = c
         else: todo.append(i)
-    for _ in range(2):
-        if not todo: break
-        try: got = await ask([(i, pkgs[i]) for i in todo])
-        except Exception: got = {}
-        for i in list(todo):
-            d = norm(got.get(i))
-            if d and valid(d, flat(pkgs[i])):
-                res[i] = d; cache_put(pkey(pkgs[i]), d); todo.remove(i)
-    for i in todo: res[i] = fallback(pkgs[i])
-    return res
+    if todo:
+        task = asyncio.create_task(work(todo, pkgs, ctx, res))  # keeps running and caching even if we time out
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=40)
+        except Exception as e:
+            print("decide timeout/error:", repr(e)[:200])
+    return [r if r else fallback(pkgs[i]) for i, r in enumerate(res)]
 
 def make_proposal(pk, d):
     refs, act = d["evidenceRefs"], d["action"]
-    rat = f"Action {act} selected. {str(d.get('reason',''))[:900]} Decisive evidence: {refs[0]}, {refs[1]}, {refs[2]}."
+    rat = f"Action {act} selected. {str(d.get('reason', ''))[:900]} Decisive evidence: {refs[0]}, {refs[1]}, {refs[2]}."
+    if len(rat) < 60:
+        rat += " The cited references are the controlling facts for this invoice package."
     return {"packageId": pk["packageId"], "actionId": "act-" + uuid.uuid4().hex, "action": act,
             "facts": d["facts"], "evidenceRefs": refs, "rationale": rat[:1500]}
 
@@ -209,10 +261,13 @@ async def send(req: Request):
 
 async def start(p, msg, h, data):
     pk = data.get("packages") if isinstance(data, dict) else None
-    if not isinstance(pk, list) or not pk or not data.get("batchId") or not all(isinstance(x, dict) and isinstance(x.get("packageId"), str) for x in pk) \
-            or len({x["packageId"] for x in pk}) != len(pk):
+    if (not isinstance(pk, list) or not pk or not data.get("batchId")
+            or not all(isinstance(x, dict) and isinstance(x.get("packageId"), str) for x in pk)
+            or len({x["packageId"] for x in pk}) != len(pk)):
         return err(400, "INVALID_ARGUMENT", "Malformed batch")
-    decisions = await decide(pk)
+    print("SAMPLE:", canon(pk[0])[:2500])
+    ctx = {k: v for k, v in data.items() if k != "packages"}
+    decisions = await decide(pk, ctx)
     tid, cid = str(uuid.uuid4()), str(uuid.uuid4())
     m = dict(msg); m["taskId"], m["contextId"] = tid, cid
     task = {"id": tid, "contextId": cid,
@@ -234,7 +289,8 @@ async def finish(p, msg, h, data):
         if t["status"]["state"] in TERMINAL: return err(409, "TASK_TERMINAL", "Task is already terminal")
         stored = t["artifacts"][0]["parts"][0]["data"]
         results = data.get("results") if isinstance(data, dict) else None
-        if not isinstance(data, dict) or data.get("batchId") != stored["batchId"] or not isinstance(results, list) or not results:
+        if (not isinstance(data, dict) or data.get("batchId") != stored["batchId"]
+                or not isinstance(results, list) or not results):
             return err(400, "INVALID_ARGUMENT", "Batch mismatch")
         by_id = {x["packageId"]: x for x in stored["proposals"]}
         seen, execs = set(), []
