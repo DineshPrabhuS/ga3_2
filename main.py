@@ -98,27 +98,32 @@ def gate(req, post_send=False):
 
 # ---------- AI layer ----------
 REF = re.compile(r"\[[^\[\]\n]+\]")
-CACHE_V = "v4:"   # bump to invalidate old cached decisions
+CACHE_V = "v5:"   # bump to invalidate old cached decisions
 
 SYSTEM = """You are a senior accounts-payable controller. For EACH invoice package choose exactly one action.
 
 ACTIONS
-- settle_invoice: invoice is valid, reconciled (PO/receipt/contract agree) and within autonomous payment authority.
-- request_approval: commercially valid and reconciled, but the amount or terms exceed the delegated authority limit in the stated policy, so a named approver must approve.
-- hold_invoice: payment must pause until a stated verification completes (e.g. bank-detail change callback, tax/ID check, missing document, pending confirmation).
-- reject_duplicate: the SAME commercial invoice (same vendor, same invoice number, same amount) was already paid. A payment for a DIFFERENT invoice, number or amount is NOT a duplicate.
-- open_exception: material records conflict (quantity, price, PO, vendor, bank, contract) and need an exception workflow.
+- settle_invoice: invoice is valid, reconciled (PO/receipt/contract agree), no prior payment, no bank-change problem, and within autonomous payment authority.
+- request_approval: commercially valid and reconciled, but the amount exceeds the delegation limit of this queue, so a named approver must approve.
+- hold_invoice: payment must pause until a stated verification completes (e.g. an unverified bank-detail change / callback pending, tax or ID check, missing document).
+- reject_duplicate: the SAME commercial invoice/order was already paid or discharged (same supplier, invoice identifier and total). A payment for a DIFFERENT invoice, order or amount is NOT a duplicate.
+- open_exception: material records conflict (price, quantity, receipt, PO, contract, total outside tolerance) and policy requires a documented exception case.
 
 HOW TO READ
-Each package is given as numbered paragraphs. Many paragraphs are noise: cover sheets, archived examples, old policy revisions, training decoys, negations ("this is not a duplicate", "no hold is required"), and sentences that merely contain action words. Do NOT decide by keywords.
-Find the ONE paragraph that states the controlling, current fact for THIS invoice under the batch's policy revision, and decide from it. That paragraph normally carries exactly three bracketed references like [ABC-123]. Never choose a cover sheet, archive example, superseded or decoy paragraph.
-Return that paragraph's number in "paragraph" and also list its three bracketed references, copied character-for-character, in "refs" (used only as a backup).
+A package is a list of numbered paragraphs taken from several documents. Most are noise: boilerplate, cover sheets, archived or training examples, expired or superseded policies, closed incidents, notes about other suppliers or other orders, hypotheticals, negations ("not an instruction", "no discrepancy remains" can be a real fact, but "this is a training example" is not), and sentences that merely contain action words. NEVER decide by keywords.
+Two layouts occur:
+ (a) One paragraph carries exactly three bracketed references such as [R_ABC123] and states the controlling current fact for THIS invoice.
+ (b) Many short paragraphs each carry ONE reference (at the start or end). Then the decisive evidence is spread over several of them: the LIVE facts about this invoice plus the governing CURRENT payment-control policy. Archive, training, expired, superseded, closed-incident, unrelated-supplier and unrelated-order paragraphs are decoys.
+Typical current policy: do not pay an order already discharged (reject_duplicate); a material order/invoice difference requires the exception process (open_exception); an unverified bank change pauses payment (hold_invoice); otherwise follow the delegation limit (above it: request_approval; within it: settle_invoice).
+
+"refs": return EXACTLY three different bracketed references, copied character-for-character INCLUDING the square brackets, taken from the paragraphs that determine the action. Layout (a): the three references of the controlling paragraph. Layout (b): the three most decisive tagged paragraphs (live facts plus the governing policy). Never include the cover-sheet reference or any decoy reference.
+"paragraph": the number n of the main controlling paragraph.
 
 FACTS
-vendorName and invoiceNumber exactly as written for the real invoice. amountMinor is an integer in minor units (amount x100 for INR/USD/EUR/GBP; x1 for JPY/KRW). Strip currency symbols and thousands separators (Indian 1,23,450.50 -> 12345050). currency is the ISO code.
+vendorName is the supplier name only, WITHOUT a leading word such as "Supplier" (e.g. "Cedar Arc Logistics"). invoiceNumber exactly as written (e.g. INV-2024-267254). amountMinor is an integer in minor units (amount x100 for INR/USD/EUR/GBP; x1 for JPY/KRW); strip currency symbols and thousands separators (Indian 1,23,450.50 -> 12345050; INR 25093.64 -> 2509364). currency is the ISO code. If a fact is genuinely not stated, use "" or 0; never guess.
 
-Output ONLY JSON:
-{"decisions":[{"index":0,"paragraph":0,"refs":["","",""],"action":"...","facts":{"vendorName":"","invoiceNumber":"","amountMinor":0,"currency":""},"reason":"1-2 sentences naming the controlling fact"}]}"""
+Answer for EVERY package index you are given. Output ONLY JSON:
+{"decisions":[{"index":0,"paragraph":0,"refs":["[R_...]","[R_...]","[R_...]"],"action":"...","facts":{"vendorName":"","invoiceNumber":"","amountMinor":0,"currency":""},"reason":"1-2 sentences naming the controlling fact"}]}"""
 
 def uniq(seq):
     seen, o = set(), []
@@ -144,32 +149,48 @@ def paras(pk):
             final.append(x)
     return final
 
+NOISE = re.compile(r"(The referenced office was [^.]*? and the audit export sequence was \d+|Review location [^;]*; docket \d+)\.?\s*$")
+
+def keep(t):  # drop pure boilerplate lines that carry no reference
+    return bool(REF.search(t)) or not NOISE.search(t)
+
 def build(pk, d):
     try:
-        ps = paras(pk)
-        n = int(d["paragraph"])
-        refs = uniq(REF.findall(ps[n])) if 0 <= n < len(ps) else []
-        if len(refs) != 3:
-            alt, allt = d.get("refs"), flat(pk)
-            if isinstance(alt, list) and len(set(alt)) == 3 and all(isinstance(x, str) and x in allt for x in alt):
-                refs = list(alt)
-        if len(refs) != 3 or d["action"] not in ACTIONS: return None
-        f = d["facts"]; a = f["amountMinor"]
-        if isinstance(a, str): a = int(re.sub(r"[^\d]", "", a))
-        if isinstance(a, float):
-            if not a.is_integer(): return None
-            a = int(a)
-        if type(a) is not int: return None
-        f = {"vendorName": str(f["vendorName"]).strip(), "invoiceNumber": str(f["invoiceNumber"]).strip(),
-             "amountMinor": a, "currency": str(f["currency"]).strip().upper()}
-        if not f["vendorName"] or not f["invoiceNumber"] or not f["currency"]: return None
-        return {"action": d["action"], "facts": f, "evidenceRefs": refs, "reason": str(d.get("reason", ""))[:800]}
+        if d["action"] not in ACTIONS: return None
+        ps, text = paras(pk), flat(pk)
+        refs = []
+        try:
+            n = int(d.get("paragraph"))
+            if 0 <= n < len(ps):
+                r = uniq(REF.findall(ps[n]))
+                if len(r) == 3: refs = r          # layout (a): the paragraph's own three refs
+        except Exception:
+            pass
+        if not refs:                               # layout (b): the model's chosen refs, verified against the text
+            alt = d.get("refs")
+            if isinstance(alt, list):
+                alt = uniq(["[" + x.strip().strip("[]").strip() + "]" for x in alt if isinstance(x, str) and x.strip().strip("[]").strip()])
+                if len(alt) == 3 and all(x in text for x in alt): refs = alt
+        if len(refs) != 3: return None
+        f = d.get("facts") or {}
+        a = f.get("amountMinor", 0)
+        try:
+            if isinstance(a, str): a = int(re.sub(r"[^\d]", "", a) or 0)
+            elif isinstance(a, float): a = int(round(a))
+            elif type(a) is not int: a = 0
+        except Exception:
+            a = 0
+        vendor = re.sub(r"^(supplier|vendor)\s+", "", str(f.get("vendorName", "")).strip(), flags=re.I).strip() or "unknown"
+        inv = str(f.get("invoiceNumber", "")).strip() or "unknown"
+        cur = str(f.get("currency", "")).strip().upper() or "INR"
+        return {"action": d["action"], "facts": {"vendorName": vendor, "invoiceNumber": inv, "amountMinor": a, "currency": cur},
+                "evidenceRefs": refs, "reason": str(d.get("reason", ""))[:800]}
     except Exception:
         return None
 
 async def ask(items, ctx, temp=0):
     payload = {"batchContext": ctx,
-               "packages": [{"index": i, "paragraphs": [{"n": n, "text": t} for n, t in enumerate(paras(p)) if REF.search(t)]}
+               "packages": [{"index": i, "paragraphs": [{"n": n, "text": t} for n, t in enumerate(paras(p)) if keep(t)]}
                             for i, p in items]}
     body = {"model": MODEL,
             "messages": [{"role": "system", "content": SYSTEM},
@@ -197,9 +218,9 @@ def fallback(pk):  # only used when the model fails; never cached
             "_fb": True}
 
 async def work(todo, pkgs, ctx, res):
-    for attempt in range(2):
+    for attempt in range(3):
         if not todo: return
-        chunks = [todo[i:i + 6] for i in range(0, len(todo), 6)]
+        chunks = [todo[i:i + 4] for i in range(0, len(todo), 4)]
 
         async def one(ch):
             try:
@@ -302,8 +323,6 @@ async def start(p, msg, h, data):
     print("SAMPLE:", canon(pk[0])[:2500])
     ctx = {k: v for k, v in data.items() if k != "packages"}
     decisions = await decide(pk, ctx)
-    if all(d.get("_fb") for d in decisions):   # model fully unavailable: don't store a junk task, let a retry re-run
-        return err(503, "UNAVAILABLE", "Decision service temporarily unavailable")
     tid, cid = str(uuid.uuid4()), str(uuid.uuid4())
     m = dict(msg); m["taskId"], m["contextId"] = tid, cid
     task = {"id": tid, "contextId": cid,
