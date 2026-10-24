@@ -14,6 +14,7 @@ BASE_PATH = urlparse(BASE_URL).path.rstrip("/")
 API_BASE = os.environ.get("LLM_BASE_URL", "https://aipipe.org/openrouter/v1").rstrip("/")
 API_KEY = os.environ["LLM_API_KEY"]
 MODEL = os.environ.get("LLM_MODEL", "openai/gpt-4.1-mini")
+REASONING_MODEL = bool(re.search(r"(^|/)(gpt-5|o\d)", MODEL))   # these reject temperature / max_tokens
 
 BATCH_MT = "application/vnd.ga5.invoice-claim-batch+json"
 PROP_MT = "application/vnd.ga5.invoice-action-proposals+json"
@@ -97,7 +98,7 @@ def gate(req, post_send=False):
 
 # ---------- AI layer ----------
 REF = re.compile(r"\[[^\[\]\n]+\]")
-CACHE_V = "v3:"   # bump to invalidate old cached decisions
+CACHE_V = "v4:"   # bump to invalidate old cached decisions
 
 SYSTEM = """You are a senior accounts-payable controller. For EACH invoice package choose exactly one action.
 
@@ -111,16 +112,13 @@ ACTIONS
 HOW TO READ
 Each package is given as numbered paragraphs. Many paragraphs are noise: cover sheets, archived examples, old policy revisions, training decoys, negations ("this is not a duplicate", "no hold is required"), and sentences that merely contain action words. Do NOT decide by keywords.
 Find the ONE paragraph that states the controlling, current fact for THIS invoice under the batch's policy revision, and decide from it. That paragraph normally carries exactly three bracketed references like [ABC-123]. Never choose a cover sheet, archive example, superseded or decoy paragraph.
-Return that paragraph's number in "paragraph". Code will copy its references; do not write refs yourself.
+Return that paragraph's number in "paragraph" and also list its three bracketed references, copied character-for-character, in "refs" (used only as a backup).
 
 FACTS
 vendorName and invoiceNumber exactly as written for the real invoice. amountMinor is an integer in minor units (amount x100 for INR/USD/EUR/GBP; x1 for JPY/KRW). Strip currency symbols and thousands separators (Indian 1,23,450.50 -> 12345050). currency is the ISO code.
 
 Output ONLY JSON:
-{"decisions":[{"index":0,"paragraph":0,"action":"...","facts":{"vendorName":"","invoiceNumber":"","amountMinor":0,"currency":""},"reason":"1-2 sentences naming the controlling fact"}]}"""
-
-def paras(pk):
-    return [x.strip() for x in re.split(r"\n\s*\n", flat(pk)) if x.strip()]
+{"decisions":[{"index":0,"paragraph":0,"refs":["","",""],"action":"...","facts":{"vendorName":"","invoiceNumber":"","amountMinor":0,"currency":""},"reason":"1-2 sentences naming the controlling fact"}]}"""
 
 def uniq(seq):
     seen, o = set(), []
@@ -129,11 +127,32 @@ def uniq(seq):
             seen.add(x); o.append(x)
     return o
 
+def paras(pk):
+    # split on blank lines; if a block holds more than 3 refs, split further by line, then by sentence
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", flat(pk)) if b.strip()]
+    lines = []
+    for b in blocks:
+        if len(uniq(REF.findall(b))) > 3:
+            lines += [l.strip() for l in b.split("\n") if l.strip()]
+        else:
+            lines.append(b)
+    final = []
+    for x in lines:
+        if len(uniq(REF.findall(x))) > 3:
+            final += [s.strip() for s in re.split(r"(?<=[.;])\s+", x) if s.strip()]
+        else:
+            final.append(x)
+    return final
+
 def build(pk, d):
     try:
         ps = paras(pk)
         n = int(d["paragraph"])
-        refs = uniq(REF.findall(ps[n]))
+        refs = uniq(REF.findall(ps[n])) if 0 <= n < len(ps) else []
+        if len(refs) != 3:
+            alt, allt = d.get("refs"), flat(pk)
+            if isinstance(alt, list) and len(set(alt)) == 3 and all(isinstance(x, str) and x in allt for x in alt):
+                refs = list(alt)
         if len(refs) != 3 or d["action"] not in ACTIONS: return None
         f = d["facts"]; a = f["amountMinor"]
         if isinstance(a, str): a = int(re.sub(r"[^\d]", "", a))
@@ -150,11 +169,15 @@ def build(pk, d):
 
 async def ask(items, ctx, temp=0):
     payload = {"batchContext": ctx,
-               "packages": [{"index": i, "paragraphs": [{"n": n, "text": t} for n, t in enumerate(paras(p))]}
+               "packages": [{"index": i, "paragraphs": [{"n": n, "text": t} for n, t in enumerate(paras(p)) if REF.search(t)]}
                             for i, p in items]}
-    body = {"model": MODEL, "temperature": temp,
+    body = {"model": MODEL,
             "messages": [{"role": "system", "content": SYSTEM},
                          {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]}
+    if not REASONING_MODEL:
+        body["temperature"] = temp
+    if os.environ.get("REASONING_EFFORT"):
+        body["reasoning_effort"] = os.environ["REASONING_EFFORT"]
     if os.environ.get("JSON_MODE", "1") == "1":
         body["response_format"] = {"type": "json_object"}
     async with httpx.AsyncClient(timeout=40) as c:
@@ -170,7 +193,8 @@ def fallback(pk):  # only used when the model fails; never cached
     refs = (uniq(REF.findall(flat(pk))) + ["[?1]", "[?2]", "[?3]"])[:3]
     return {"action": "hold_invoice",
             "facts": {"vendorName": "unknown", "invoiceNumber": "unknown", "amountMinor": 0, "currency": "INR"},
-            "evidenceRefs": refs, "reason": "Automated analysis unavailable; payment held pending verification."}
+            "evidenceRefs": refs, "reason": "Automated analysis unavailable; payment held pending verification.",
+            "_fb": True}
 
 async def work(todo, pkgs, ctx, res):
     for attempt in range(2):
@@ -233,6 +257,16 @@ CARD = {
                 "tags": ["invoice", "accounts-payable", "approvals"]}],
 }
 
+@app.get("/selftest")
+async def selftest():
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.post(f"{API_BASE}/chat/completions", headers={"Authorization": f"Bearer {API_KEY}"},
+                             json={"model": MODEL, "messages": [{"role": "user", "content": "Say OK"}]})
+        return {"ok": r.status_code == 200, "llm_status": r.status_code}
+    except Exception as e:
+        return {"ok": False, "error": repr(e)[:200]}
+
 @app.get("/.well-known/agent-card.json")
 async def card():
     return Response(json.dumps(CARD), media_type="application/json")
@@ -268,6 +302,8 @@ async def start(p, msg, h, data):
     print("SAMPLE:", canon(pk[0])[:2500])
     ctx = {k: v for k, v in data.items() if k != "packages"}
     decisions = await decide(pk, ctx)
+    if all(d.get("_fb") for d in decisions):   # model fully unavailable: don't store a junk task, let a retry re-run
+        return err(503, "UNAVAILABLE", "Decision service temporarily unavailable")
     tid, cid = str(uuid.uuid4()), str(uuid.uuid4())
     m = dict(msg); m["taskId"], m["contextId"] = tid, cid
     task = {"id": tid, "contextId": cid,
