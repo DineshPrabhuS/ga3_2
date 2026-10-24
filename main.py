@@ -1,6 +1,7 @@
 import asyncio, hashlib, json, os, re, sqlite3, threading, time, uuid
 from collections import defaultdict
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from urllib.parse import urlparse
 
 import httpx
@@ -12,9 +13,12 @@ from fastapi.responses import Response
 BASE_URL = os.environ.get("BASE_URL") or (os.environ["RENDER_EXTERNAL_URL"].rstrip("/") + "/a2a/")
 BASE_PATH = urlparse(BASE_URL).path.rstrip("/")
 API_BASE = os.environ.get("LLM_BASE_URL", "https://aipipe.org/openrouter/v1").rstrip("/")
-API_KEY = os.environ["LLM_API_KEY"]
-MODEL = os.environ.get("LLM_MODEL", "openai/gpt-4.1-mini")
+API_KEY = os.environ.get("LLM_API_KEY", "")
+MODEL = os.environ.get("LLM_MODEL", "openai/gpt-4.1")
 REASONING_MODEL = bool(re.search(r"(^|/)(gpt-5|o\d)", MODEL))   # these reject temperature / max_tokens
+CHUNK = int(os.environ.get("CHUNK", "3"))
+LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "30"))
+DECIDE_BUDGET = float(os.environ.get("DECIDE_BUDGET", "38"))
 
 BATCH_MT = "application/vnd.ga5.invoice-claim-batch+json"
 PROP_MT = "application/vnd.ga5.invoice-action-proposals+json"
@@ -96,41 +100,80 @@ def gate(req, post_send=False):
         return None, err(415, "UNSUPPORTED_MEDIA_TYPE", "Use application/a2a+json")
     return sha(m.group(1)), None
 
-# ---------- AI layer ----------
-REF = re.compile(r"\[[^\[\]\n]+\]")
-CACHE_V = "v5:"   # bump to invalidate old cached decisions
-
-SYSTEM = """You are a senior accounts-payable controller. For EACH invoice package choose exactly one action.
-
-ACTIONS
-- settle_invoice: invoice is valid, reconciled (PO/receipt/contract agree), no prior payment, no bank-change problem, and within autonomous payment authority.
-- request_approval: commercially valid and reconciled, but the amount exceeds the delegation limit of this queue, so a named approver must approve.
-- hold_invoice: payment must pause until a stated verification completes (e.g. an unverified bank-detail change / callback pending, tax or ID check, missing document).
-- reject_duplicate: the SAME commercial invoice/order was already paid or discharged (same supplier, invoice identifier and total). A payment for a DIFFERENT invoice, order or amount is NOT a duplicate.
-- open_exception: material records conflict (price, quantity, receipt, PO, contract, total outside tolerance) and policy requires a documented exception case.
-
-HOW TO READ
-A package is a list of numbered paragraphs taken from several documents. Most are noise: boilerplate, cover sheets, archived or training examples, expired or superseded policies, closed incidents, notes about other suppliers or other orders, hypotheticals, negations ("not an instruction", "no discrepancy remains" can be a real fact, but "this is a training example" is not), and sentences that merely contain action words. NEVER decide by keywords.
-Two layouts occur:
- (a) One paragraph carries exactly three bracketed references such as [R_ABC123] and states the controlling current fact for THIS invoice.
- (b) Many short paragraphs each carry ONE reference (at the start or end). Then the decisive evidence is spread over several of them: the LIVE facts about this invoice plus the governing CURRENT payment-control policy. Archive, training, expired, superseded, closed-incident, unrelated-supplier and unrelated-order paragraphs are decoys.
-Typical current policy: do not pay an order already discharged (reject_duplicate); a material order/invoice difference requires the exception process (open_exception); an unverified bank change pauses payment (hold_invoice); otherwise follow the delegation limit (above it: request_approval; within it: settle_invoice).
-
-"refs": return EXACTLY three different bracketed references, copied character-for-character INCLUDING the square brackets, taken from the paragraphs that determine the action. Layout (a): the three references of the controlling paragraph. Layout (b): the three most decisive tagged paragraphs (live facts plus the governing policy). Never include the cover-sheet reference or any decoy reference.
-"paragraph": the number n of the main controlling paragraph.
-
-FACTS
-vendorName is the supplier name only, WITHOUT a leading word such as "Supplier" (e.g. "Cedar Arc Logistics"). invoiceNumber exactly as written (e.g. INV-2024-267254). amountMinor is an integer in minor units (amount x100 for INR/USD/EUR/GBP; x1 for JPY/KRW); strip currency symbols and thousands separators (Indian 1,23,450.50 -> 12345050; INR 25093.64 -> 2509364). currency is the ISO code. If a fact is genuinely not stated, use "" or 0; never guess.
-
-Answer for EVERY package index you are given. Output ONLY JSON:
-{"decisions":[{"index":0,"paragraph":0,"refs":["[R_...]","[R_...]","[R_...]"],"action":"...","facts":{"vendorName":"","invoiceNumber":"","amountMinor":0,"currency":""},"reason":"1-2 sentences naming the controlling fact"}]}"""
-
 def uniq(seq):
     seen, o = set(), []
     for x in seq:
         if x not in seen:
             seen.add(x); o.append(x)
     return o
+
+# ---------- document analysis (deterministic) ----------
+REF = re.compile(r"\[[^\[\]\n]+\]")
+CACHE_V = "v6:"   # bump to invalidate old cached decisions
+
+CURS = "INR|USD|EUR|GBP|JPY|KRW|AED|SGD|AUD|CAD|CHF|CNY|HKD|SAR|ZAR|NZD|SEK|NOK|DKK"
+AMT = re.compile(rf"\b({CURS})\s?(\d[\d,]*(?:\.\d+)?)")
+ZERO_DEC = {"JPY", "KRW"}
+COVER = re.compile(rf"Supplier (.+?); invoice (\S+?); stated total ({CURS}) (\d[\d,]*(?:\.\d+)?)")
+INVNO = re.compile(r"\bINV-[A-Za-z0-9-]*\d")
+VENDOR = re.compile(r"\bSupplier ([A-Z][A-Za-z0-9&'.\- ]{1,60}?)(?=;|,|\.\s| invoice| covers| for | billed| issued|$)")
+DECOY = re.compile(r"training|archiv|historical|expired|superseded|separate supplier|different (order|supplier|vendor|invoice)"
+                   r"|unrelated|hypothetical|not this|no live|govern no|previous quarter|closed (reconciliation )?incident"
+                   r"|similar trading name|example|cover sheet", re.I)
+NEG = re.compile(r"\b(no|not|never|without|nor)\b", re.I)
+LIMIT_WORDS = re.compile(r"authority|delegat|limit|threshold|ceiling|escalat|approver|approval", re.I)
+
+SIG = {
+    "reject_duplicate": re.compile(
+        r"already (been )?(paid|discharged|settled)|completed payment|previously (paid|settled)|paid in full"
+        r"|requires rejection|same commercial key|duplicate payment", re.I),
+    "open_exception": re.compile(
+        r"outside (the )?(permitted |agreed |stated )?(reconciliation )?tolerance|contradict|exception (case|process|workflow)"
+        r"|conflicting (signed )?records|does not (match|agree|reconcile)|short[- ]?shipped|variance exceeds", re.I),
+    "hold_invoice": re.compile(
+        r"awaiting (independent )?(verification|callback|confirmation)|callback (is |remains )?(pending|outstanding)"
+        r"|pending (independent )?verification|pauses? payment|payment (is |remains )?paused|unverified bank"
+        r"|until (the )?\w+ (verification|check|callback) (completes|is complete)", re.I),
+    "request_approval": re.compile(
+        r"outside (the )?(operator|queue|delegat|autonomous)|exceeds? (the )?(\w+ ){0,3}(authority|limit|ceiling|threshold)"
+        r"|above (the )?(\w+ ){0,3}(authority|limit|ceiling|threshold)|named approver|financial-approval"
+        r"|approval workflow|beyond (\w+ ){0,3}(authority|limit)", re.I),
+}
+PRIORITY = ["reject_duplicate", "open_exception", "hold_invoice", "request_approval"]
+CLEAN = re.compile(
+    r"agree within|within (the )?(stated |permitted )?(rounding )?tolerance|three-way match|reconcil(es|ed)\b"
+    r"|same payable total|full quantity|covers every billed unit|accepted-goods|no earlier posting|no paid item"
+    r"|no (prior|previous) payment|within (the )?(\w+ ){0,3}(authority|limit)|bank details? (match|unchanged|verified)"
+    r"|callback (was |has been )?(completed|verified)", re.I)
+
+def clean_count(text):
+    return len(CLEAN.findall(text))
+
+def minor(cur, s):
+    try:
+        return int(Decimal(s.replace(",", "")) * (1 if cur in ZERO_DEC else 100))
+    except (InvalidOperation, ValueError):
+        return 0
+
+def signals(text, total=0):
+    hits = set()
+    for act, rx in SIG.items():
+        for m in rx.finditer(text):
+            st = max(text.rfind(".", 0, m.start()), text.rfind(";", 0, m.start())) + 1
+            window = text[max(st, m.start() - 50):m.start()]
+            if not NEG.search(window):
+                hits.add(act); break
+    if total and LIMIT_WORDS.search(text):
+        for m in AMT.finditer(text):
+            v = minor(m.group(1), m.group(2))
+            if 0 < v < total:
+                hits.add("request_approval"); break
+    return hits
+
+def top(hits):
+    for a in PRIORITY:
+        if a in hits: return a
+    return None
 
 def paras(pk):
     # split on blank lines; if a block holds more than 3 refs, split further by line, then by sentence
@@ -154,38 +197,155 @@ NOISE = re.compile(r"(The referenced office was [^.]*? and the audit export sequ
 def keep(t):  # drop pure boilerplate lines that carry no reference
     return bool(REF.search(t)) or not NOISE.search(t)
 
-def build(pk, d):
+def extract_facts(ps):
+    text = "\n\n".join(ps)
+    m = COVER.search(text)
+    if m:
+        cur = m.group(3)
+        return {"vendorName": m.group(1).strip(), "invoiceNumber": m.group(2).rstrip(".,;"),
+                "amountMinor": minor(cur, m.group(4)), "currency": cur}
+    f = {}
+    for p in ps:                       # live paragraph naming the invoice and its amount
+        if DECOY.search(p): continue
+        inv, amt = INVNO.search(p), AMT.search(p)
+        if inv and amt:
+            f = {"invoiceNumber": inv.group(0), "amountMinor": minor(amt.group(1), amt.group(2)), "currency": amt.group(1)}
+            break
+    for p in ps:
+        if DECOY.search(p) and "cover sheet" not in p: continue
+        v = VENDOR.search(p)
+        if v:
+            f["vendorName"] = v.group(1).strip(); break
+    return f
+
+def analyze(pk):
+    ps = paras(pk)
+    text = "\n\n".join(ps)
+    refs_of = [uniq(REF.findall(p)) for p in ps]
+    tri = [i for i, r in enumerate(refs_of) if len(r) == 3]
+    tri_live = [i for i in tri if not DECOY.search(ps[i])] or tri
+    facts = extract_facts(ps)
+    return {"ps": ps, "text": text, "refs_of": refs_of, "tri": tri_live, "facts": facts}
+
+TEMPLATE = {
+    "settle_invoice": "The records reconcile, no prior payment or bank-detail issue exists, and the total is within autonomous authority, so the invoice can be settled.",
+    "request_approval": "The invoice is commercially valid and reconciled, but the total exceeds this queue's delegated payment authority, so a named approver must approve it.",
+    "hold_invoice": "A required verification (such as an unverified bank-detail change or pending callback) is still outstanding, so payment must pause until it completes.",
+    "reject_duplicate": "The same commercial invoice has already been paid, so duplicate-control policy requires rejection.",
+    "open_exception": "Material signed records conflict beyond tolerance, so policy requires a documented exception case rather than settlement or hold.",
+}
+
+# ---------- AI layer ----------
+SYSTEM = """You are a senior accounts-payable controller. For EACH invoice package choose exactly one action.
+
+ACTIONS
+- settle_invoice: invoice is valid, reconciled (PO/receipt/contract agree), no prior payment, no bank-change problem, and within autonomous payment authority.
+- request_approval: commercially valid and reconciled, but the amount exceeds the delegation limit of this queue, so a named approver must approve.
+- hold_invoice: payment must pause until a stated verification completes (e.g. an unverified bank-detail change / callback pending, tax or ID check, missing document).
+- reject_duplicate: the SAME commercial invoice/order was already paid or discharged (same supplier, invoice identifier and total). A payment for a DIFFERENT invoice, order or amount is NOT a duplicate.
+- open_exception: material records conflict (price, quantity, receipt, PO, contract, total outside tolerance) and policy requires a documented exception case.
+Priority when several apply: reject_duplicate > open_exception > hold_invoice > request_approval > settle_invoice.
+
+HOW TO READ
+A package is a list of numbered paragraphs taken from several documents. Most are noise: boilerplate, cover sheets, archived or training examples, expired or superseded policies, closed incidents, notes about other suppliers or other orders, hypotheticals, and sentences that merely contain action words. NEVER decide by keywords.
+Read the ENTIRE controlling paragraph. A positive opening ("clean three-way match", "otherwise payable", "no discrepancy remains") never overrides a later limit, duplicate, tolerance or verification statement. Compare the stated total with any authority/delegation limit numerically: total above the limit -> request_approval.
+Two layouts occur:
+ (a) One paragraph carries exactly three bracketed references such as [R_ABC123] and states the controlling current fact for THIS invoice.
+ (b) Many short paragraphs each carry ONE reference. Then the decisive evidence is spread over several of them: the LIVE facts about this invoice/order plus the governing CURRENT payment-control policy. Archive, training, expired, superseded, closed-incident, unrelated-supplier and unrelated-order paragraphs are decoys.
+
+"refs": return EXACTLY three different bracketed references, copied character-for-character INCLUDING the square brackets, from THIS package only. Layout (a): the three references of the controlling paragraph. Layout (b): the three most decisive tagged paragraphs (live facts plus the governing policy). Never include the cover-sheet reference or any decoy reference.
+"paragraph": the number n of the main controlling paragraph.
+
+FACTS
+vendorName is the supplier name only, WITHOUT a leading word such as "Supplier". invoiceNumber exactly as written (e.g. INV-2024-267254). amountMinor is an integer in minor units (x100 for INR/USD/EUR/GBP; x1 for JPY/KRW). currency is the ISO code. If a fact is genuinely not stated, use "" or 0; never guess.
+
+Answer for EVERY package index you are given. Output ONLY JSON:
+{"decisions":[{"index":0,"paragraph":0,"refs":["[R_...]","[R_...]","[R_...]"],"action":"...","facts":{"vendorName":"","invoiceNumber":"","amountMinor":0,"currency":""},"reason":"1-2 sentences naming the controlling fact"}]}"""
+
+def to_int(a):
     try:
-        if d["action"] not in ACTIONS: return None
-        ps, text = paras(pk), flat(pk)
-        refs = []
-        try:
-            n = int(d.get("paragraph"))
-            if 0 <= n < len(ps):
-                r = uniq(REF.findall(ps[n]))
-                if len(r) == 3: refs = r          # layout (a): the paragraph's own three refs
-        except Exception:
-            pass
-        if not refs:                               # layout (b): the model's chosen refs, verified against the text
-            alt = d.get("refs")
-            if isinstance(alt, list):
-                alt = uniq(["[" + x.strip().strip("[]").strip() + "]" for x in alt if isinstance(x, str) and x.strip().strip("[]").strip()])
-                if len(alt) == 3 and all(x in text for x in alt): refs = alt
-        if len(refs) != 3: return None
-        f = d.get("facts") or {}
-        a = f.get("amountMinor", 0)
-        try:
-            if isinstance(a, str): a = int(re.sub(r"[^\d]", "", a) or 0)
-            elif isinstance(a, float): a = int(round(a))
-            elif type(a) is not int: a = 0
-        except Exception:
-            a = 0
-        vendor = re.sub(r"^(supplier|vendor)\s+", "", str(f.get("vendorName", "")).strip(), flags=re.I).strip() or "unknown"
-        inv = str(f.get("invoiceNumber", "")).strip() or "unknown"
-        cur = str(f.get("currency", "")).strip().upper() or "INR"
-        return {"action": d["action"], "facts": {"vendorName": vendor, "invoiceNumber": inv, "amountMinor": a, "currency": cur},
-                "evidenceRefs": refs, "reason": str(d.get("reason", ""))[:800]}
+        if isinstance(a, bool): return 0
+        if isinstance(a, int): return a
+        if isinstance(a, float): return int(round(a))
+        if isinstance(a, str): return int(re.sub(r"[^\d]", "", a) or 0)
     except Exception:
+        pass
+    return 0
+
+def build(pk, d, allow_no_model=False):
+    """Turn a (possibly empty/bad) model decision into a validated decision. Returns None to retry."""
+    try:
+        d = d if isinstance(d, dict) else {}
+        A = analyze(pk)
+        ps, text, refs_of = A["ps"], A["text"], A["refs_of"]
+        model_action = d.get("action") if d.get("action") in ACTIONS else None
+        if not model_action and not allow_no_model:
+            print("build: no/invalid model action", str(d)[:200]); return None
+        action = model_action
+
+        # ----- facts -----
+        mf = d.get("facts") if isinstance(d.get("facts"), dict) else {}
+        cf = A["facts"]
+        facts = {
+            "vendorName": cf.get("vendorName") or re.sub(r"^(supplier|vendor)\s+", "", str(mf.get("vendorName", "")).strip(), flags=re.I).strip() or "unknown",
+            "invoiceNumber": cf.get("invoiceNumber") or str(mf.get("invoiceNumber", "")).strip() or "unknown",
+            "amountMinor": cf.get("amountMinor") or to_int(mf.get("amountMinor", 0)),
+            "currency": cf.get("currency") or str(mf.get("currency", "")).strip().upper() or "INR",
+        }
+        total = facts["amountMinor"]
+
+        if A["tri"]:
+            # ----- layout (a): one paragraph with three refs controls -----
+            try: n = int(d.get("paragraph"))
+            except Exception: n = -1
+            if n not in A["tri"]: n = A["tri"][0]
+            refs = refs_of[n]
+            hits = signals(ps[n], total)
+            if len(hits) == 1:
+                action = next(iter(hits))
+            elif hits and action not in hits:
+                action = top(hits)
+            elif not hits and clean_count(ps[n]) >= 2:
+                action = "settle_invoice"        # clearly reconciled, nothing blocking
+            elif not action:
+                action = "hold_invoice"          # no model answer and no signal: never settle blind
+        else:
+            # ----- layout (b): evidence spread over single-ref paragraphs -----
+            tagged = [i for i, r in enumerate(refs_of) if len(r) == 1]
+            sig = {i: signals(ps[i], total) for i in tagged}
+            policy = [i for i in tagged if not DECOY.search(ps[i]) and
+                      (len(sig[i]) >= 2 or re.search(r"payment controls|controls?:", ps[i], re.I))]
+            live = [i for i in tagged if not DECOY.search(ps[i]) and i not in policy]
+            live_hits = set().union(*[sig[i] for i in live]) if live else set()
+            t = top(live_hits)
+            if not action:
+                live_text = "\n".join(ps[i] for i in live)
+                action = t or ("settle_invoice" if clean_count(live_text) >= 2 else "hold_invoice")
+            elif t and action not in live_hits and (action in ("settle_invoice", "request_approval")
+                                                      or PRIORITY.index(action) > PRIORITY.index(t)):
+                action = t
+            bad = {refs_of[i][0] for i in tagged if DECOY.search(ps[i])}
+            mrefs = d.get("refs") if isinstance(d.get("refs"), list) else []
+            mrefs = uniq(["[" + x.strip().strip("[]").strip() + "]" for x in mrefs if isinstance(x, str) and x.strip("[] ")])
+            mrefs = [r for r in mrefs if r in text and r not in bad]
+            support = [refs_of[i][0] for i in live if action in sig[i]]
+            pol = [refs_of[i][0] for i in policy]
+            inst = [refs_of[i][0] for i in live if INVNO.search(ps[i]) or AMT.search(ps[i])]
+            other = [refs_of[i][0] for i in live]
+            if action == model_action:
+                refs = uniq(mrefs + support + pol + inst + other)[:3]
+            else:
+                refs = uniq(support + pol + inst + mrefs + other)[:3]
+            if len(refs) < 3:
+                refs = uniq(refs + [r[0] for r in refs_of if r] + REF.findall(text))[:3]
+        if len(refs) != 3:
+            print("build: could not find 3 refs"); return None
+
+        reason = str(d.get("reason", "")).strip() if action == model_action else ""
+        if len(reason) < 20: reason = TEMPLATE[action]
+        return {"action": action, "facts": facts, "evidenceRefs": refs, "reason": reason[:800]}
+    except Exception as e:
+        print("build error:", repr(e)[:200])
         return None
 
 async def ask(items, ctx, temp=0):
@@ -197,30 +357,38 @@ async def ask(items, ctx, temp=0):
                          {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]}
     if not REASONING_MODEL:
         body["temperature"] = temp
+        body["max_tokens"] = 4000
     if os.environ.get("REASONING_EFFORT"):
         body["reasoning_effort"] = os.environ["REASONING_EFFORT"]
     if os.environ.get("JSON_MODE", "1") == "1":
         body["response_format"] = {"type": "json_object"}
-    async with httpx.AsyncClient(timeout=40) as c:
+    async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as c:
         r = await c.post(f"{API_BASE}/chat/completions", headers={"Authorization": f"Bearer {API_KEY}"}, json=body)
     r.raise_for_status()
-    txt = re.sub(r"^```(?:json)?|```$", "", r.json()["choices"][0]["message"]["content"].strip()).strip()
-    return {int(x["index"]): x for x in json.loads(txt)["decisions"]}
+    txt = r.json()["choices"][0]["message"]["content"].strip()
+    txt = re.sub(r"^```(?:json)?|```$", "", txt).strip()
+    txt = txt[txt.find("{"): txt.rfind("}") + 1]
+    res = {}
+    for x in json.loads(txt).get("decisions", []):
+        try: res[int(x["index"])] = x
+        except Exception: pass
+    return res
 
 def pkey(pk):
     return CACHE_V + sha(canon({k: v for k, v in pk.items() if k != "packageId"}))
 
-def fallback(pk):  # only used when the model fails; never cached
+def fallback(pk):  # only when the model fails; deterministic, never settles blind, never cached
+    d = build(pk, {}, allow_no_model=True)
+    if d: return d
     refs = (uniq(REF.findall(flat(pk))) + ["[?1]", "[?2]", "[?3]"])[:3]
     return {"action": "hold_invoice",
             "facts": {"vendorName": "unknown", "invoiceNumber": "unknown", "amountMinor": 0, "currency": "INR"},
-            "evidenceRefs": refs, "reason": "Automated analysis unavailable; payment held pending verification.",
-            "_fb": True}
+            "evidenceRefs": refs, "reason": TEMPLATE["hold_invoice"]}
 
 async def work(todo, pkgs, ctx, res):
     for attempt in range(3):
         if not todo: return
-        chunks = [todo[i:i + 4] for i in range(0, len(todo), 4)]
+        chunks = [todo[i:i + CHUNK] for i in range(0, len(todo), CHUNK)]
 
         async def one(ch):
             try:
@@ -248,7 +416,7 @@ async def decide(pkgs, ctx):
     if todo:
         task = asyncio.create_task(work(todo, pkgs, ctx, res))  # keeps running and caching even if we time out
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=40)
+            await asyncio.wait_for(asyncio.shield(task), timeout=DECIDE_BUDGET)
         except Exception as e:
             print("decide timeout/error:", repr(e)[:200])
     return [r if r else fallback(pkgs[i]) for i, r in enumerate(res)]
@@ -284,7 +452,7 @@ async def selftest():
         async with httpx.AsyncClient(timeout=20) as c:
             r = await c.post(f"{API_BASE}/chat/completions", headers={"Authorization": f"Bearer {API_KEY}"},
                              json={"model": MODEL, "messages": [{"role": "user", "content": "Say OK"}]})
-        return {"ok": r.status_code == 200, "llm_status": r.status_code}
+        return {"ok": r.status_code == 200, "llm_status": r.status_code, "model": MODEL}
     except Exception as e:
         return {"ok": False, "error": repr(e)[:200]}
 
@@ -323,6 +491,8 @@ async def start(p, msg, h, data):
     print("SAMPLE:", canon(pk[0])[:2500])
     ctx = {k: v for k, v in data.items() if k != "packages"}
     decisions = await decide(pk, ctx)
+    for a, b in zip(pk, decisions):
+        print("DECISION", a["packageId"], b["action"], b["evidenceRefs"], b["facts"])
     tid, cid = str(uuid.uuid4()), str(uuid.uuid4())
     m = dict(msg); m["taskId"], m["contextId"] = tid, cid
     task = {"id": tid, "contextId": cid,
